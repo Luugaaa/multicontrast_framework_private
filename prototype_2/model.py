@@ -61,6 +61,28 @@ class OutConv(nn.Module):
         return self.conv(x)
 
 
+class RegistrationUNet(nn.Module):
+    def __init__(self, in_channels=2, out_channels=2):
+        super().__init__()
+        self.inc = DoubleConv(in_channels, 32)
+        self.down1 = Down(32, 64)
+        self.down2 = Down(64, 128)
+        self.up1 = Up(128, 64)
+        self.up2 = Up(64, 32)
+        # The output convolution predicts the 2-channel (dx, dy) displacement field
+        self.outc = OutConv(32, out_channels)
+
+    def forward(self, x):
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x = self.up1(x3, x2)
+        x = self.up2(x, x1)
+        return self.outc(x)
+
+
+    
+
 class AttentionFusion(nn.Module):
     """
     Learns to adaptively fuse a variable number of feature maps using an
@@ -179,64 +201,137 @@ class AlignmentAndFusionUNet(nn.Module):
         # --- 1. Registration Head (The STN's Localization Network) ---
         # This small CNN predicts the 6 parameters of an affine transformation matrix.
         # It takes a pair of images (reference + one moving) as input.
-        self.registration_head = nn.Sequential(
-            DoubleConv(in_channels * 2, 32),
-            nn.MaxPool2d(2),
-            DoubleConv(32, 64),
-            nn.MaxPool2d(2),
-            DoubleConv(64, 128),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 6) # Output 6 parameters for the 2x3 affine matrix
-        )
-        # Initialize the final layer to output an identity transformation
-        self.registration_head[-1].weight.data.zero_()
-        self.registration_head[-1].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
-
+        # self.registration_head = nn.Sequential(
+        #     DoubleConv(in_channels * 2, 32),
+        #     nn.MaxPool2d(2),
+        #     DoubleConv(32, 64),
+        #     nn.MaxPool2d(2),
+        #     DoubleConv(64, 128),
+        #     nn.AdaptiveAvgPool2d(1),
+        #     nn.Flatten(),
+        #     nn.Linear(128, 64),
+        #     nn.ReLU(),
+        #     nn.Linear(64, 6) # Output 6 parameters for the 2x3 affine matrix
+        # )
+        
+        # # Initialize the final layer to output an identity transformation
+        # self.registration_head[-1].weight.data.zero_()
+        # self.registration_head[-1].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
+        self.registration_network = RegistrationUNet(in_channels * 2, 2)
+        
+        self.registration_network.outc.conv.weight.data.zero_()
+        self.registration_network.outc.conv.bias.data.zero_()
+        
         # --- 2. The Core Segmentation Network ---
         # We use the previously defined BoundaryAwareUNet for the main task.
         self.segmentation_network = BoundaryAwareUNet(in_channels, out_channels)
 
-    def spatial_transformer(self, moving_image, theta):
+    def spatial_transformer(self, moving_image, ddf):
         """
-        Applies the predicted affine transformation `theta` to the `moving_image`.
-        This is the warping part of the STN.
+        Applies the predicted dense displacement field (DDF) to the moving_image,
+        correctly handling coordinate systems.
         """
-        # `theta` has shape, reshape to for the grid sampler
-        theta = theta.view(-1, 2, 3)
-        # Generate the sampling grid
-        grid = F.affine_grid(theta, moving_image.size(), align_corners=False)
-        # Sample the moving image using the grid to get the warped image
-        warped_image = F.grid_sample(moving_image, grid, align_corners=False)
+        B, C, H, W = moving_image.shape
+        
+        # 1. Create a base identity grid of pixel coordinates
+        vectors = [torch.arange(0, s, device=ddf.device) for s in (H, W)]
+        # 'ij' indexing gives us grids in (Height, Width) or (Y, X) order
+        grids = torch.meshgrid(vectors, indexing='ij')
+        y_coords = grids[0].float() # Shape (H, W)
+        x_coords = grids[1].float() # Shape (H, W)
+
+        # 2. Add the displacements from the DDF
+        # ddf has shape (B, 2, H, W), where ddf[:, 0] is dx and ddf[:, 1] is dy
+        dx = ddf[:, 0, ...] # Displacement in the x-direction (Width)
+        dy = ddf[:, 1, ...] # Displacement in the y-direction (Height)
+        
+        # Add the displacement to the original coordinates
+        # Note: x_coords and y_coords are broadcasted to the batch size B
+        final_x_coords = x_coords + dx
+        final_y_coords = y_coords + dy
+
+        # 3. Stack the final coordinates into the (x, y) format expected by grid_sample
+        # The final shape needs to be (B, H, W, 2)
+        final_coords = torch.stack([final_x_coords, final_y_coords], dim=-1)
+
+        # 4. Normalize the coordinates to the range [-1, 1] for grid_sample
+        # Normalize x coordinates (dimension -1, index 0)
+        final_coords[..., 0] = 2 * (final_coords[..., 0] / (W - 1)) - 1
+        # Normalize y coordinates (dimension -1, index 1)
+        final_coords[..., 1] = 2 * (final_coords[..., 1] / (H - 1)) - 1
+        
+        # 5. Sample the input image using the calculated grid
+        warped_image = F.grid_sample(moving_image, final_coords, align_corners=True, padding_mode="zeros")
+        
         return warped_image
 
     def forward(self, reference_contrast, moving_contrasts):
-        """
-        Args:
-            reference_contrast (torch.Tensor): The fixed image, shape.
-            moving_contrasts (list of torch.Tensor): A list of N moving images,
-                                                     each of shape.
-        """
         aligned_contrasts = [reference_contrast]
+        # This will hold the DDFs for calculating the smoothness loss later
+        predicted_ddfs = []
 
-        # --- Part 1: Align each moving contrast to the reference ---
         for moving_contrast in moving_contrasts:
-            # Concatenate reference and moving images to feed to the registration head
             registration_input = torch.cat([reference_contrast, moving_contrast], dim=1)
+            # Predict the DDF
+            ddf = self.registration_network(registration_input)
+            predicted_ddfs.append(ddf)
             
-            # Predict the transformation parameters
-            theta = self.registration_head(registration_input)
-            
-            # Warp the moving contrast using the predicted parameters
-            warped_moving_contrast = self.spatial_transformer(moving_contrast, theta)
-            
+            # Warp the moving contrast using the DDF
+            warped_moving_contrast = self.spatial_transformer(moving_contrast, ddf)
             aligned_contrasts.append(warped_moving_contrast)
 
-        # --- Part 2: Fuse and Segment the aligned stack ---
-        # Stack the aligned contrasts into a single tensor for the segmentation network
-        final_input_stack = torch.stack(aligned_contrasts, dim=1) # Shape
+        final_input_stack = torch.stack(aligned_contrasts, dim=1)
         
-        # Pass the perfectly aligned stack to the segmentation network
-        return self.segmentation_network(final_input_stack)
+        # Get segmentation results
+        seg_outputs = self.segmentation_network(final_input_stack)
+        
+        # Add the DDFs and warped images to the output dict for loss calculation
+        seg_outputs["predicted_ddfs"] = torch.stack(predicted_ddfs, dim=1)
+        # You've already returned the warped images in your latest code, which is great
+        # Let's adjust it to return only the *moving* ones that were warped
+        seg_outputs["warped_moving_contrasts"] = torch.stack(aligned_contrasts, dim=1)
+
+        return seg_outputs
+    
+    # def spatial_transformer(self, moving_image, theta):
+    #     """
+    #     Applies the predicted affine transformation `theta` to the `moving_image`.
+    #     This is the warping part of the STN.
+    #     """
+    #     # `theta` has shape, reshape to for the grid sampler
+    #     theta = theta.view(-1, 2, 3)
+    #     # Generate the sampling grid
+    #     grid = F.affine_grid(theta, moving_image.size(), align_corners=False)
+    #     # Sample the moving image using the grid to get the warped image
+    #     warped_image = F.grid_sample(moving_image, grid, align_corners=False)
+    #     return warped_image
+
+    # def forward(self, reference_contrast, moving_contrasts):
+    #     """
+    #     Args:
+    #         reference_contrast (torch.Tensor): The fixed image, shape.
+    #         moving_contrasts (list of torch.Tensor): A list of N moving images,
+    #                                                  each of shape.
+    #     """
+    #     aligned_contrasts = [reference_contrast]
+
+    #     # --- Part 1: Align each moving contrast to the reference ---
+    #     for moving_contrast in moving_contrasts:
+    #         # Concatenate reference and moving images to feed to the registration head
+    #         registration_input = torch.cat([reference_contrast, moving_contrast], dim=1)
+            
+    #         # Predict the transformation parameters
+    #         theta = self.registration_head(registration_input)
+            
+    #         # Warp the moving contrast using the predicted parameters
+    #         warped_moving_contrast = self.spatial_transformer(moving_contrast, theta)
+            
+    #         aligned_contrasts.append(warped_moving_contrast)
+
+    #     # --- Part 2: Fuse and Segment the aligned stack ---
+    #     # Stack the aligned contrasts into a single tensor for the segmentation network
+    #     final_input_stack = torch.stack(aligned_contrasts, dim=1) # Shape
+        
+    #     # Pass the perfectly aligned stack to the segmentation network
+    #     return self.segmentation_network(final_input_stack)
+    

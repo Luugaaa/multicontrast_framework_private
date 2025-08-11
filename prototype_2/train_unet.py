@@ -92,7 +92,9 @@ class DiceLoss(nn.Module):
         super(DiceLoss, self).__init__()
         self.smooth = smooth
     def forward(self, logits, targets):
-        preds = torch.sigmoid(logits); preds = preds.view(-1); targets = targets.view(-1)
+        preds = torch.sigmoid(logits)
+        preds = preds.view(-1)
+        targets = targets.view(-1)
         intersection = (preds * targets).sum()
         dice_coeff = (2. * intersection + self.smooth) / (preds.sum() + targets.sum() + self.smooth)
         return 1 - dice_coeff
