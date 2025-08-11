@@ -49,7 +49,7 @@ else:
 
 config = {
     "dataset_dir": "datasets/mri_dataset_v2",
-    "contrasts_to_use": [1],
+    "contrasts_to_use": [1, 5],
     "primary_contrast_id": 1,
     "num_subjects": 200,
     "learning_rate": 1e-4,
