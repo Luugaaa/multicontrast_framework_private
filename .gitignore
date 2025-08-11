@@ -1,0 +1,6 @@
+.venv/
+*datasets/
+*wandb/
+*.pyc
+.DS_Store
+*.pth
