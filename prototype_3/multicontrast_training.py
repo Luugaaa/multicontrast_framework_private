@@ -1,7 +1,7 @@
 # train_multimodal.py
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0" 
+os.environ["CUDA_VISIBLE_DEVICES"] = "3" 
 
 import torch
 import torch.nn as nn
@@ -146,9 +146,10 @@ class MassQuantileLoss(nn.Module):
         total_loss = 0.0
         # Calculate the distance for each pair of corresponding quantile points
         for q_ref, q_warped in zip(quantile_points_ref, quantile_points_warped):
-            q_ref /= torch.tensor([ref_image.shape[3], ref_image.shape[2]], device=ref_image.device)
-            q_warped /= torch.tensor([ref_image.shape[3], ref_image.shape[2]], device=ref_image.device)
-            total_loss += torch.mean(((q_ref - q_warped)*40)**4) ## penalize a lot when the distance is large  only
+            # q_ref /= torch.tensor([ref_image.shape[3], ref_image.shape[2]], device=ref_image.device)
+            # q_warped /= torch.tensor([ref_image.shape[3], ref_image.shape[2]], device=ref_image.device)
+            # total_loss += torch.mean(((q_ref - q_warped)*40)**4) ## penalize a lot when the distance is large  only
+            total_loss += torch.mean((q_ref - q_warped)**2)
         
         return total_loss
     
@@ -177,7 +178,7 @@ config = {
     "primary_contrast_id": 1,
     "num_subjects": 200,
     "learning_rate": 1e-4,
-    "batch_size": 16,
+    "batch_size": 2,
     "num_epochs": 200,
     "val_split": 0.2,
     "boundary_loss_alpha": 1.0,
@@ -203,7 +204,7 @@ CONTRAST_COLORS = [
 def draw_keypoints(image, com_coords, quantile_coords_list, color, size_factor=1):
     """Draws Center of Mass and Quantile points on an image."""
     # Draw Center of Mass (larger circle)
-    if com_coords : 
+    if com_coords is not None : 
         com_x, com_y = int(com_coords[0]), int(com_coords[1])
         cv2.circle(image, (com_x, com_y), radius=int(3*size_factor), color=color, thickness=-1)
         cv2.circle(image, (com_x, com_y), radius=int(3*size_factor), color=(255, 255, 255), thickness=1)
@@ -230,7 +231,7 @@ def log_predictions_to_wandb(batch, outputs, epoch, config, processed_image=None
     pred_masks_np = (torch.sigmoid(outputs['mask']).cpu().detach().numpy() > 0.5)
 
     # --- Instantiate helpers for keypoint calculation ---
-    # com_calculator = CenterOfMassLoss()._calculate_com
+    com_calculator = CenterOfMassLoss()._calculate_com
     quantile_calculator = MassQuantileLoss(quantiles=[0.25, 0.5, 0.75])._calculate_quantiles
 
     log_images = []
@@ -254,14 +255,14 @@ def log_predictions_to_wandb(batch, outputs, epoch, config, processed_image=None
                 color = CONTRAST_COLORS[c_idx % len(CONTRAST_COLORS)]
 
                 # Calculate keypoints
-                # com = com_calculator(img_tensor)[0].cpu().numpy()
+                com = com_calculator(img_tensor)[0].cpu().numpy()
                 quantiles = [q[0].cpu().numpy() for q in quantile_calculator(img_tensor)]
 
                 if c_idx>0 : 
                     size_factor = 1.5
                 else : size_factor = 1.0
                 color_ = [int(el//2) for el in color]
-                draw_keypoints(misaligned_overlap_img, None, quantiles, color_, size_factor)
+                draw_keypoints(misaligned_overlap_img, com, quantiles, color_, size_factor)
 
 
         panels.append(misaligned_overlap_img)
@@ -284,14 +285,14 @@ def log_predictions_to_wandb(batch, outputs, epoch, config, processed_image=None
                 color = CONTRAST_COLORS[c_idx % len(CONTRAST_COLORS)]
 
                 # Calculate keypoints
-                # com = com_calculator(img_tensor)[0].cpu().numpy()
+                com = com_calculator(img_tensor)[0].cpu().numpy()
                 quantiles = [q[0].cpu().numpy() for q in quantile_calculator(img_tensor)]
 
                 if c_idx>0 : 
                     size_factor = 1.5
                 else : size_factor = 1.0
                 color_ = [int(el//2) for el in color]
-                draw_keypoints(aligned_overlap_img, None, quantiles, color_, size_factor)
+                draw_keypoints(aligned_overlap_img, com, quantiles, color_, size_factor)
 
         panels.append(aligned_overlap_img)
         panel_captions.append("Aligned Overlap + Keypoints")
@@ -373,7 +374,7 @@ def main():
     loss_fn = BoundaryLoss(alpha=config["boundary_loss_alpha"])
     alignment_loss_fn = DiceLoss()
     dff_loss_fn = BendingEnergyLoss()
-    # com_loss_fn = CenterOfMassLoss()
+    com_loss_fn = CenterOfMassLoss()
     quantile_loss_fn = MassQuantileLoss(quantiles=[0.25, 0.5, 0.75]) # Using quartiles + median
 
 
@@ -442,13 +443,13 @@ def main():
                     # ref_prob = torch.sigmoid(reference_contrast)
                     # warped_prob = torch.sigmoid(warped_img)
 
-                    # tmp_total_com_loss += com_loss_fn(reference_contrast, warped_img)
+                    tmp_total_com_loss += com_loss_fn(reference_contrast, warped_img)
                     tmp_total_quantile_loss += quantile_loss_fn(reference_contrast, warped_img)
 
-                # com_loss = tmp_total_com_loss / num_warped
+                com_loss = tmp_total_com_loss / num_warped
                 quantile_loss = tmp_total_quantile_loss / num_warped
             else:
-                # com_loss = 0.0
+                com_loss = 0.0
                 quantile_loss = 0.0
                 
             seg_loss, mask_loss, boundary_loss = loss_fn(outputs, {"mask": reference_mask, "boundary": boundaries})
@@ -469,7 +470,7 @@ def main():
             loss = (seg_loss 
                 + lambda_alignment * total_align_loss 
                 + lambda_reg * reg_loss
-                # + lambda_com * com_loss
+                + lambda_com * com_loss
                 + lambda_quantile * quantile_loss)
             
             
@@ -483,7 +484,7 @@ def main():
             total_boundary_loss += boundary_loss.item()
             total_epoch_align_loss += lambda_alignment * total_align_loss.item()
             total_reg_loss += reg_loss.item() * lambda_reg
-            # total_epoch_com_loss += com_loss.item() * lambda_com
+            total_epoch_com_loss += com_loss.item() * lambda_com
             total_epoch_quantile_loss += quantile_loss.item() * lambda_quantile
             # total_dff_loss += dff_loss.item() * lambda_dff
 
@@ -493,7 +494,7 @@ def main():
                    "train_losses/align_loss": total_epoch_align_loss, 
                    "train_losses/dff_loss": total_dff_loss, 
                    "train_losses/reg_loss": total_reg_loss,
-                #    "train_losses/com_loss": total_epoch_com_loss,
+                   "train_losses/com_loss": total_epoch_com_loss,
                     # "metrics/max_abosulte_dice": max_absolute_dice,
                    "train_losses/quantile_loss": total_epoch_quantile_loss})
             
