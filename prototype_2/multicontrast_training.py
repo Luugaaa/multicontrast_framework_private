@@ -41,6 +41,116 @@ class BoundaryLoss(nn.Module):
         loss_boundary = self.dice_loss(boundary_logits, gt_boundary)
         return loss_mask + self.alpha * loss_boundary, loss_mask, loss_boundary
 
+import torch
+import torch.nn as nn
+
+class CenterOfMassLoss(nn.Module):
+    """
+    Calculates the squared Euclidean distance between the centers of mass of two images.
+    Expects inputs to be probability maps or non-negative feature maps.
+    """
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def _calculate_com(self, image):
+        """Calculates the center of mass for a batch of images."""
+        B, C, H, W = image.shape
+        image = F.relu(image - config["dark_threshold"])
+        # Create coordinate grids
+        y_coords, x_coords = torch.meshgrid(
+            [torch.arange(H, device=image.device, dtype=torch.float32),
+             torch.arange(W, device=image.device, dtype=torch.float32)],
+            indexing='ij'
+        ) # Shapes (H, W)
+
+        # Total mass for each image in the batch
+        total_mass = image.sum(dim=[1, 2, 3]) + self.eps # Shape (B,)
+
+        # Calculate weighted coordinates
+        weighted_y = (y_coords * image).sum(dim=[1, 2, 3]) # Shape (B,)
+        weighted_x = (x_coords * image).sum(dim=[1, 2, 3]) # Shape (B,)
+
+        # Calculate center of mass coordinates
+        com_y = weighted_y / total_mass
+        com_x = weighted_x / total_mass
+
+        return torch.stack([com_x, com_y], dim=1) # Shape (B, 2)
+
+    def forward(self, ref_image, warped_image):
+        """
+        Args:
+            ref_image (torch.Tensor): The reference image (B, C, H, W).
+            warped_image (torch.Tensor): The warped moving image (B, C, H, W).
+        """
+        com_ref = self._calculate_com(ref_image)
+        com_warped = self._calculate_com(warped_image)
+
+        # Calculate the squared Euclidean distance between the CoMs
+        loss = torch.mean((com_ref - com_warped)**2)
+        
+        return loss
+    
+class MassQuantileLoss(nn.Module):
+    """
+    Calculates the squared distance between intensity-weighted quantile points of two images.
+    """
+    def __init__(self, quantiles=[0.25, 0.75], eps=1e-8):
+        super().__init__()
+        self.quantiles = quantiles
+        self.eps = eps
+
+    def _calculate_quantiles(self, image):
+        """Calculates the quantile coordinates for a batch of images."""
+        image = F.relu(image - config["dark_threshold"])
+        B, C, H, W = image.shape
+        
+        # Total mass for normalization
+        total_mass = image.sum(dim=[1, 2, 3]) + self.eps
+
+        # --- Y-axis Quantiles ---
+        mass_y = image.sum(dim=3) # Project mass onto Y-axis, Shape (B, C, H)
+        cum_mass_y = torch.cumsum(mass_y, dim=2) # Cumulative sum along Y
+        
+        # --- X-axis Quantiles ---
+        mass_x = image.sum(dim=2) # Project mass onto X-axis, Shape (B, C, W)
+        cum_mass_x = torch.cumsum(mass_x, dim=2)
+
+        quantile_points = []
+        for q in self.quantiles:
+            # Find target cumulative mass for this quantile
+            target_mass = q * total_mass.view(B, 1, 1)
+
+            # Find the index where the cumulative mass exceeds the target
+            # searchsorted is efficient for finding this insertion point
+            q_y = torch.searchsorted(cum_mass_y.contiguous(), target_mass).float().squeeze(-1)
+            q_x = torch.searchsorted(cum_mass_x.contiguous(), target_mass).float().squeeze(-1)
+            
+            # We get one point per channel, let's average them
+            quantile_points.append(torch.stack([q_x.mean(dim=1), q_y.mean(dim=1)], dim=1))
+
+        # Returns a list of tensors, each of shape (B, 2)
+        return quantile_points
+
+    def forward(self, ref_image, warped_image):
+        """
+        Args:
+            ref_image (torch.Tensor): The reference image (B, C, H, W).
+            warped_image (torch.Tensor): The warped moving image (B, C, H, W).
+        """
+        quantile_points_ref = self._calculate_quantiles(ref_image)
+        quantile_points_warped = self._calculate_quantiles(warped_image)
+
+        total_loss = 0.0
+        # Calculate the distance for each pair of corresponding quantile points
+        for q_ref, q_warped in zip(quantile_points_ref, quantile_points_warped):
+            q_ref /= torch.tensor([ref_image.shape[3], ref_image.shape[2]], device=ref_image.device)
+            q_warped /= torch.tensor([ref_image.shape[3], ref_image.shape[2]], device=ref_image.device)
+            total_loss += torch.mean(((q_ref - q_warped)*20)**4) ## penalize a lot when the distance is large  only
+        
+        return total_loss
+    
+    
 class BendingEnergyLoss(nn.Module):
     """
     Calculates the bending energy of a dense displacement field to enforce smoothness.
@@ -65,17 +175,18 @@ config = {
     "primary_contrast_id": 1,
     "num_subjects": 200,
     "learning_rate": 1e-4,
-    "batch_size": 4,
+    "batch_size": 2,
     "num_epochs": 200,
     "val_split": 0.2,
     "boundary_loss_alpha": 1.0,
     # Misalignment settings
     "apply_misalignment": True, # This is now a core preprocessing step
-    "max_rotation": 10,
-    "max_translate": 0.08,
-    "max_scale": 0.15,
+    "max_rotation": 5,
+    "max_translate": 0.05,
+    "max_scale": 0.05,
     "single_contrast_epochs": 0,
-    "contrast_dropout_rate": 0.3
+    "contrast_dropout_rate": 0.3,
+    "dark_threshold": 0.1, # Threshold for dark regions in images
 }
 
 # --- 2. Visualization Helper ---
@@ -87,72 +198,128 @@ CONTRAST_COLORS = [
     (0, 255, 255), # Cyan
     (255, 0, 255), # Magenta
 ]
-
-def log_predictions_to_wandb(batch, outputs, epoch, config):
-    """Logs a comprehensive panel showing misalignment and model performance."""
-    all_contrasts = batch['contrasts'].cpu().numpy()
-    primary_contrast_el_id = config['contrasts_to_use'].index(config["primary_contrast_id"])
-    primary_contrast = batch['contrasts'][:, primary_contrast_el_id].cpu().numpy()
-    aligned_contrasts = outputs['warped_moving_contrasts'].cpu().numpy()
-    gt_masks_raw = batch['masks'][:, primary_contrast_el_id]
-    gt_masks = gt_masks_raw.cpu().numpy()
+def draw_keypoints(image, com_coords, quantile_coords_list, color, size_factor=1):
+    """Draws Center of Mass and Quantile points on an image."""
+    # Draw Center of Mass (larger circle)
+    if com_coords : 
+        com_x, com_y = int(com_coords[0]), int(com_coords[1])
+        cv2.circle(image, (com_x, com_y), radius=int(3*size_factor), color=color, thickness=-1)
+        cv2.circle(image, (com_x, com_y), radius=int(3*size_factor), color=(255, 255, 255), thickness=1)
     
-    pred_masks = (torch.sigmoid(outputs['mask']).cpu().detach().numpy() > 0.5)
-    gt_boundaries = masks_to_boundaries_gpu(gt_masks_raw.cpu()).numpy()
-    pred_boundaries = (torch.sigmoid(outputs['boundary']).cpu().detach().numpy() > 0.5)
+    # Draw Quantile Points (smaller circles)
+    if quantile_coords_list : 
+        for q_coords in quantile_coords_list:
+            q_x, q_y = int(q_coords[0]), int(q_coords[1])
+            cv2.circle(image, (q_x, q_y), radius=int(2*size_factor), color=color, thickness=-1)
+            cv2.circle(image, (q_x, q_y), radius=int(2*size_factor), color=(255, 255, 255), thickness=1)
+
+def log_predictions_to_wandb(batch, outputs, epoch, config, processed_image=None, max_dice=None):
+    """Logs a comprehensive panel showing misalignment, alignment, and model performance."""
+    # Move tensors to CPU and convert to numpy
+    all_contrasts_np = batch['contrasts'].cpu().numpy()
+    aligned_contrasts_t = outputs['warped_moving_contrasts'].cpu()
+    aligned_contrasts_np = aligned_contrasts_t.numpy()
+    
+    primary_contrast_idx = config['contrasts_to_use'].index(config["primary_contrast_id"])
+    primary_contrast_np = all_contrasts_np[:, primary_contrast_idx]
+    
+    gt_masks_raw = batch['masks'][:, primary_contrast_idx]
+    gt_masks_np = gt_masks_raw.cpu().numpy()
+    pred_masks_np = (torch.sigmoid(outputs['mask']).cpu().detach().numpy() > 0.5)
+
+    # --- Instantiate helpers for keypoint calculation ---
+    # com_calculator = CenterOfMassLoss()._calculate_com
+    quantile_calculator = MassQuantileLoss(quantiles=[0.25, 0.5, 0.75])._calculate_quantiles
 
     log_images = []
-    for i in range(min(all_contrasts.shape[0], 4)):
+    for i in range(min(all_contrasts_np.shape[0], 4)): # Iterate through batch items
         panels, panel_captions = [], []
         
-        # Panel 1: Color overlap of all misaligned contrasts
-        h, w = all_contrasts.shape[3], all_contrasts.shape[4]
-        overlap_img = np.zeros((h, w, 3), dtype=np.uint8)
-        for c_idx in range(all_contrasts.shape[1]):
-            img = all_contrasts[i, c_idx, 0]
+        # --- Panel 1: Original Misaligned Overlap ---
+        h, w = all_contrasts_np.shape[3], all_contrasts_np.shape[4]
+        misaligned_overlap_img = np.zeros((h, w, 3), dtype=np.uint8)
+        for c_idx in range(all_contrasts_np.shape[1]):
+            img = all_contrasts_np[i, c_idx, 0]
             binary_mask = (img > 0.1)
             color = CONTRAST_COLORS[c_idx % len(CONTRAST_COLORS)]
-            overlap_img[binary_mask] = color
-        panels.append(overlap_img)
-        panel_captions.append("Misalign Overlap")
+            misaligned_overlap_img[binary_mask] = color
         
-        # Panel 1 bis: Color overlap of all misaligned contrasts
-        h, w = aligned_contrasts.shape[3], aligned_contrasts.shape[4]
-        overlap_img = np.zeros((h, w, 3), dtype=np.uint8)
-        for c_idx in range(aligned_contrasts.shape[1]):
-            img = aligned_contrasts[i, c_idx, 0]
-            binary_mask = (img > 0.1)
-            color = CONTRAST_COLORS[c_idx % len(CONTRAST_COLORS)]
-            overlap_img[binary_mask] = color
-        panels.append(overlap_img)
-        panel_captions.append("Misalign Overlap after spatial transformer")
-        
+        with torch.no_grad():
+            for c_idx in range(all_contrasts_np.shape[1]):
+                # Get the single image tensor for calculation
+                img_tensor = torch.tensor(all_contrasts_np[i, c_idx]).unsqueeze(0)
+                # prob_map = torch.sigmoid(img_tensor)
+                color = CONTRAST_COLORS[c_idx % len(CONTRAST_COLORS)]
 
-        # Panel 2: The primary contrast (decoder's spatial reference)
-        primary_img_np = (primary_contrast[i, 0] * 255).astype(np.uint8)
-        panels.append(cv2.cvtColor(primary_img_np, cv2.COLOR_GRAY2RGB))
-        panel_captions.append(f"Ref: C{config['primary_contrast_id']}")
+                # Calculate keypoints
+                # com = com_calculator(img_tensor)[0].cpu().numpy()
+                quantiles = [q[0].cpu().numpy() for q in quantile_calculator(img_tensor)]
+
+                if c_idx>0 : 
+                    size_factor = 1.5
+                else : size_factor = 1.0
+                color_ = [int(el//2) for el in color]
+                draw_keypoints(misaligned_overlap_img, None, quantiles, color_, size_factor)
+
+
+        panels.append(misaligned_overlap_img)
+        panel_captions.append("Misaligned Overlap")
         
-        # Panel 3 & 4: GT and Predicted Mask
-        gt_mask_img = (gt_masks[i, 0] * 255).astype(np.uint8)
+        # --- Panel 2: Aligned Overlap with Keypoints ---
+        aligned_overlap_img = np.zeros((h, w, 3), dtype=np.uint8)
+        for c_idx in range(aligned_contrasts_np.shape[1]):
+            img = aligned_contrasts_np[i, c_idx, 0]
+            binary_mask = (img > 0.1)
+            color = CONTRAST_COLORS[c_idx % len(CONTRAST_COLORS)]
+            aligned_overlap_img[binary_mask] = color
+        
+        # Calculate and draw keypoints on the aligned overlap image
+        with torch.no_grad():
+            for c_idx in range(aligned_contrasts_t.shape[1]):
+                # Get the single image tensor for calculation
+                img_tensor = aligned_contrasts_t[i, c_idx].unsqueeze(0)
+                # prob_map = torch.sigmoid(img_tensor)
+                color = CONTRAST_COLORS[c_idx % len(CONTRAST_COLORS)]
+
+                # Calculate keypoints
+                # com = com_calculator(img_tensor)[0].cpu().numpy()
+                quantiles = [q[0].cpu().numpy() for q in quantile_calculator(img_tensor)]
+
+                if c_idx>0 : 
+                    size_factor = 1.5
+                else : size_factor = 1.0
+                color_ = [int(el//2) for el in color]
+                draw_keypoints(aligned_overlap_img, None, quantiles, color_, size_factor)
+
+        panels.append(aligned_overlap_img)
+        panel_captions.append("Aligned Overlap + Keypoints")
+    
+        for c_idx in range(aligned_contrasts_np.shape[1]):
+            img = (aligned_contrasts_np[i, c_idx, 0] * 255).astype(np.uint8)
+            panels.append(cv2.cvtColor(img, cv2.COLOR_GRAY2RGB))
+            panel_captions.append(f"Aligned Contrast C{config['contrasts_to_use'][c_idx]}")
+
+        
+        gt_mask_img = (gt_masks_np[i, 0] * 255).astype(np.uint8)
         panels.append(cv2.cvtColor(gt_mask_img, cv2.COLOR_GRAY2RGB))
         panel_captions.append("GT Mask")
-        pred_mask_img = (pred_masks[i, 0] * 255).astype(np.uint8)
+
+        pred_mask_img = (pred_masks_np[i, 0] * 255).astype(np.uint8)
         panels.append(cv2.cvtColor(pred_mask_img, cv2.COLOR_GRAY2RGB))
         panel_captions.append("Pred Mask")
-
-        # Panel 5 & 6: GT and Predicted Boundaries
-        gt_boundary_img = (gt_boundaries[i, 0] * 255).astype(np.uint8)
-        panels.append(cv2.cvtColor(gt_boundary_img, cv2.COLOR_GRAY2RGB))
-        panel_captions.append("GT Boundary")
-        pred_boundary_img = (pred_boundaries[i, 0] * 255).astype(np.uint8)
-        panels.append(cv2.cvtColor(pred_boundary_img, cv2.COLOR_GRAY2RGB))
-        panel_captions.append("Pred Boundary")
+        
+        if processed_image is not None: 
+            processed_image_ = (processed_image[i, 0] * 255).astype(np.uint8)
+            panels.append(cv2.cvtColor(processed_image_, cv2.COLOR_GRAY2RGB))
+            panel_captions.append(f"Contrast merged - max_dice {max_dice:.2f}")
+            # log_images.append(wandb.Image(processed_image, caption=f"Processed Image for Subj {batch['subject_id'][i]}, max_dice:{max_dice}"))
+    
 
         final_image = np.concatenate(panels, axis=1)
         final_caption = f"Subj {batch['subject_id'][i]}: " + " | ".join(panel_captions)
         log_images.append(wandb.Image(final_image, caption=final_caption))
-    
+        
+
     wandb.log({"Validation Predictions": log_images, "epoch": epoch})
 
 # --- 3. Main Training Function ---
@@ -185,10 +352,17 @@ def main():
     
     
     loss_fn = BoundaryLoss(alpha=config["boundary_loss_alpha"])
-    alignment_loss_fn = nn.MSELoss()
+    alignment_loss_fn = DiceLoss()
     dff_loss_fn = BendingEnergyLoss()
-    lambda_alignment = 30.0
+    # com_loss_fn = CenterOfMassLoss()
+    quantile_loss_fn = MassQuantileLoss(quantiles=[0.25, 0.5, 0.75]) # Using quartiles + median
+
+
+    lambda_alignment = 3.0
     lambda_dff = 10.0
+    lambda_reg = 10.0
+    lambda_com = 0.007
+    lambda_quantile = 0.002
     optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
     scheduler = CosineAnnealingLR(optimizer, T_max=config["num_epochs"])
     
@@ -200,6 +374,9 @@ def main():
     for epoch in range(config["num_epochs"]):
         model.train()
         total_loss, total_mask_loss, total_boundary_loss, total_epoch_align_loss, total_dff_loss = 0, 0, 0, 0, 0
+        total_reg_loss = 0
+        total_epoch_com_loss = 0
+        total_epoch_quantile_loss = 0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
             all_contrasts = batch['contrasts'].to(DEVICE)
             all_masks = batch['masks'].to(DEVICE)
@@ -230,7 +407,31 @@ def main():
             
             optimizer.zero_grad()
             outputs = model(reference_contrast, moving_contrasts)
+            warped_contrasts = outputs["warped_moving_contrasts"] 
+
+            num_warped = warped_contrasts.size()[1] - 1 # Exclude the reference image
             
+            tmp_total_com_loss = 0.0
+            tmp_total_quantile_loss = 0.0
+            if num_warped > 0:
+                for i in range(num_warped):
+                    # The first image in the stack is the reference
+                    warped_img = warped_contrasts[:, i+1, ...]
+                    
+                    # It's best to compare the predicted masks if available, or the images themselves
+                    # For example, using sigmoid to get probability maps
+                    # ref_prob = torch.sigmoid(reference_contrast)
+                    # warped_prob = torch.sigmoid(warped_img)
+
+                    # tmp_total_com_loss += com_loss_fn(reference_contrast, warped_img)
+                    tmp_total_quantile_loss += quantile_loss_fn(reference_contrast, warped_img)
+
+                # com_loss = tmp_total_com_loss / num_warped
+                quantile_loss = tmp_total_quantile_loss / num_warped
+            else:
+                # com_loss = 0.0
+                quantile_loss = 0.0
+                
             seg_loss, mask_loss, boundary_loss = loss_fn(outputs, {"mask": reference_mask, "boundary": boundaries})
             
             total_align_loss = 0
@@ -239,23 +440,43 @@ def main():
                 adapted_warped_tensors = warped_tensors.transpose(0, 1)
                 for i, warped_mov_contrast in enumerate(adapted_warped_tensors):
                     if i==0 : continue #skip the ref contrast
-                    total_align_loss += alignment_loss_fn(warped_mov_contrast, reference_contrast)
+                    total_align_loss += alignment_loss_fn(warped_mov_contrast.contiguous(), reference_contrast.contiguous())
             
-            dff_loss = dff_loss_fn(outputs["predicted_ddfs"])
+            # dff_loss = dff_loss_fn(outputs["predicted_ddfs"])
             # Combined Loss
-            loss = seg_loss + lambda_alignment * total_align_loss + dff_loss * lambda_dff
-    
-    
+            deviations = outputs["predicted_deviations"]
+            reg_loss = torch.mean(deviations**2) 
+            
+            loss = (seg_loss 
+                + lambda_alignment * total_align_loss 
+                + lambda_reg * reg_loss
+                # + lambda_com * com_loss
+                + lambda_quantile * quantile_loss)
+            
+            
+            
             loss.backward()
             optimizer.step()
+            
             
             total_loss += loss.item()
             total_mask_loss += mask_loss.item()
             total_boundary_loss += boundary_loss.item()
             total_epoch_align_loss += lambda_alignment * total_align_loss.item()
-            total_dff_loss += dff_loss.item() * lambda_dff
-            
-        wandb.log({"train_losses/total_loss": total_loss, "train_losses/mask_loss": total_mask_loss, "train_losses/boundary_loss": total_boundary_loss, "train_losses/align_loss": total_epoch_align_loss, "train_losses/dff_loss": total_dff_loss})
+            total_reg_loss += reg_loss.item() * lambda_reg
+            # total_epoch_com_loss += com_loss.item() * lambda_com
+            total_epoch_quantile_loss += quantile_loss.item() * lambda_quantile
+            # total_dff_loss += dff_loss.item() * lambda_dff
+
+        wandb.log({"train_losses/total_loss": total_loss, 
+                   "train_losses/mask_loss": total_mask_loss, 
+                   "train_losses/boundary_loss": total_boundary_loss, 
+                   "train_losses/align_loss": total_epoch_align_loss, 
+                   "train_losses/dff_loss": total_dff_loss, 
+                   "train_losses/reg_loss": total_reg_loss,
+                #    "train_losses/com_loss": total_epoch_com_loss,
+                    # "metrics/max_abosulte_dice": max_absolute_dice,
+                   "train_losses/quantile_loss": total_epoch_quantile_loss})
             
         
         model.eval()
@@ -289,7 +510,18 @@ def main():
                 total_val_dice += dice_metric(outputs['mask'], reference_mask)
                 
                 if i == 0:
-                    log_predictions_to_wandb(batch, outputs, epoch, config)
+                    with torch.no_grad():
+                        warped_tensors = outputs['warped_moving_contrasts'][:, 1, :, :, :].squeeze(2) # B, C, 1, SIZE, SIZE
+                        binary_reference_contrast = ((reference_contrast) >= 0.1) & ((reference_contrast) <= 0.4)
+                        binary_moving_contrasts = ((warped_tensors) >= 0.1) & ((warped_tensors) <= 0.4)
+                        # sum_image = (reference_contrast + moving_contrasts[0])/2
+                        processed_image = (binary_reference_contrast + binary_moving_contrasts)/2
+                        # print((reference_contrast), "\n\n\n\n", (moving_contrasts[0]), "\n\n\n\n",processed_image)
+                        max_absolute_dice = dice_metric(processed_image, reference_mask)
+                
+            
+            
+                    log_predictions_to_wandb(batch, outputs, epoch, config, processed_image.cpu().numpy(), max_dice=max_absolute_dice)
         
         scheduler.step()
         
