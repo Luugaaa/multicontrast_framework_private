@@ -253,8 +253,7 @@ class BoundaryAwareUNet(nn.Module):
 
     def forward(self, contrasts):
         B, N, C, H, W = contrasts.shape
-        print(contrasts.shape, contrasts.shape, contrasts.shape, contrasts.shape)
-        aze
+
         skips1, skips2, skips3, skips4, bottlenecks =[],[],[],[],[]
 
         for i in range(N):
@@ -287,7 +286,7 @@ class BoundaryAwareUNet(nn.Module):
         boundary_logits = self.outc_boundary(shared_decoder_output)
         
         # Return a dictionary for clear, multi-task outputs
-        return {"mask": mask_logits, "boundary": boundary_logits}
+        return {"mask": mask_logits, "boundary": boundary_logits, "bottlenecks": torch.stack(bottlenecks, dim=1)}
     
 class AlignmentAndFusionUNet(nn.Module):
     """
@@ -299,10 +298,10 @@ class AlignmentAndFusionUNet(nn.Module):
         super().__init__()
 
 
-        # self.registration_network = RegistrationUNet(in_channels * 2, 2)
+        self.registration_network = RegistrationUNet(in_channels * 2, 2)
         
-        # self.registration_network.outc.conv.weight.data.zero_()
-        # self.registration_network.outc.conv.bias.data.zero_()
+        self.registration_network.outc.conv.weight.data.zero_()
+        self.registration_network.outc.conv.bias.data.zero_()
         
         self.registration_head = ParameterRegressionHead(in_channels * 2, 8)
 
@@ -372,12 +371,14 @@ class AlignmentAndFusionUNet(nn.Module):
             predicted_deviations.append(deviation)
             
             # Add the deviation to the identity to get the final transformation
-            final_params = self.identity.to(deviation.device) + deviation
+            # final_params = self.identity.to(deviation.device) + deviation
             
-            warped_moving_contrast = self.spatial_transformer(moving_contrast, final_params)
-            aligned_contrasts.append(warped_moving_contrast)
+            # warped_moving_contrast = self.spatial_transformer(moving_contrast, final_params)
+            # aligned_contrasts.append(warped_moving_contrast)
 
+        aligned_contrasts = [reference_contrast] + moving_contrasts
         final_input_stack = torch.stack(aligned_contrasts, dim=1)
+        
         seg_outputs = self.segmentation_network(final_input_stack)
         
         # Add the deviations for the regularization loss

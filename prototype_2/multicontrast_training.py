@@ -1,7 +1,7 @@
 # train_multimodal.py
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0" 
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0" 
 
 import torch
 import torch.nn as nn
@@ -169,7 +169,7 @@ class BendingEnergyLoss(nn.Module):
 # else:
 #     DEVICE = "cpu"
 
-DEVICE = "cuda"
+DEVICE = "mps"
 
 config = {
     "dataset_dir": "datasets/mri_dataset_v2",

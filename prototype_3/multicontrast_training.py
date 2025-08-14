@@ -1,7 +1,7 @@
 # train_multimodal.py
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3" 
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0" 
 
 import torch
 import torch.nn as nn
@@ -146,10 +146,9 @@ class MassQuantileLoss(nn.Module):
         total_loss = 0.0
         # Calculate the distance for each pair of corresponding quantile points
         for q_ref, q_warped in zip(quantile_points_ref, quantile_points_warped):
-            # q_ref /= torch.tensor([ref_image.shape[3], ref_image.shape[2]], device=ref_image.device)
-            # q_warped /= torch.tensor([ref_image.shape[3], ref_image.shape[2]], device=ref_image.device)
-            # total_loss += torch.mean(((q_ref - q_warped)*40)**4) ## penalize a lot when the distance is large  only
-            total_loss += torch.mean((q_ref - q_warped)**2)
+            q_ref /= torch.tensor([ref_image.shape[3], ref_image.shape[2]], device=ref_image.device)
+            q_warped /= torch.tensor([ref_image.shape[3], ref_image.shape[2]], device=ref_image.device)
+            total_loss += torch.mean(((q_ref - q_warped)*40)**4) ## penalize a lot when the distance is large  only
         
         return total_loss
     
@@ -170,7 +169,7 @@ class BendingEnergyLoss(nn.Module):
 # else:
 #     DEVICE = "cpu"
 
-DEVICE = "cuda"
+DEVICE = "mps"
 
 config = {
     "dataset_dir": "datasets/mri_dataset_v2",
@@ -178,7 +177,7 @@ config = {
     "primary_contrast_id": 1,
     "num_subjects": 200,
     "learning_rate": 1e-4,
-    "batch_size": 2,
+    "batch_size": 1,
     "num_epochs": 200,
     "val_split": 0.2,
     "boundary_loss_alpha": 1.0,
@@ -204,7 +203,7 @@ CONTRAST_COLORS = [
 def draw_keypoints(image, com_coords, quantile_coords_list, color, size_factor=1):
     """Draws Center of Mass and Quantile points on an image."""
     # Draw Center of Mass (larger circle)
-    if com_coords is not None : 
+    if com_coords : 
         com_x, com_y = int(com_coords[0]), int(com_coords[1])
         cv2.circle(image, (com_x, com_y), radius=int(3*size_factor), color=color, thickness=-1)
         cv2.circle(image, (com_x, com_y), radius=int(3*size_factor), color=(255, 255, 255), thickness=1)
@@ -219,109 +218,119 @@ def draw_keypoints(image, com_coords, quantile_coords_list, color, size_factor=1
 def log_predictions_to_wandb(batch, outputs, epoch, config, processed_image=None, max_dice=None):
     """Logs a comprehensive panel showing misalignment, alignment, and model performance."""
     # Move tensors to CPU and convert to numpy
-    all_contrasts_np = batch['contrasts'].cpu().numpy()
-    aligned_contrasts_t = outputs['warped_moving_contrasts'].cpu()
-    aligned_contrasts_np = aligned_contrasts_t.numpy()
-    
-    primary_contrast_idx = config['contrasts_to_use'].index(config["primary_contrast_id"])
-    primary_contrast_np = all_contrasts_np[:, primary_contrast_idx]
-    
-    gt_masks_raw = batch['masks'][:, primary_contrast_idx]
-    gt_masks_np = gt_masks_raw.cpu().numpy()
-    pred_masks_np = (torch.sigmoid(outputs['mask']).cpu().detach().numpy() > 0.5)
-
-    # --- Instantiate helpers for keypoint calculation ---
-    com_calculator = CenterOfMassLoss()._calculate_com
-    quantile_calculator = MassQuantileLoss(quantiles=[0.25, 0.5, 0.75])._calculate_quantiles
-
-    log_images = []
-    for i in range(min(all_contrasts_np.shape[0], 4)): # Iterate through batch items
-        panels, panel_captions = [], []
+    for id_ in ["2", "1"] :
+        all_contrasts_np = batch[f'contrasts_{id_}'].cpu().numpy()
         
-        # --- Panel 1: Original Misaligned Overlap ---
-        h, w = all_contrasts_np.shape[3], all_contrasts_np.shape[4]
-        misaligned_overlap_img = np.zeros((h, w, 3), dtype=np.uint8)
-        for c_idx in range(all_contrasts_np.shape[1]):
-            img = all_contrasts_np[i, c_idx, 0]
-            binary_mask = (img > 0.1)
-            color = CONTRAST_COLORS[c_idx % len(CONTRAST_COLORS)]
-            misaligned_overlap_img[binary_mask] = color
-        
-        with torch.no_grad():
+        if id_ == "1" :
             for c_idx in range(all_contrasts_np.shape[1]):
-                # Get the single image tensor for calculation
-                img_tensor = torch.tensor(all_contrasts_np[i, c_idx]).unsqueeze(0)
-                # prob_map = torch.sigmoid(img_tensor)
+                img = (all_contrasts_np[i, c_idx, 0] * 255).astype(np.uint8)
+                panels.append(cv2.cvtColor(img, cv2.COLOR_GRAY2RGB))
+                panel_captions.append(f"Contrast C{config['contrasts_to_use'][c_idx]}")
+            continue
+            
+        
+        aligned_contrasts_t = outputs['warped_moving_contrasts'].cpu()
+        aligned_contrasts_np = aligned_contrasts_t.numpy()
+        
+        primary_contrast_idx = config['contrasts_to_use'].index(config["primary_contrast_id"])
+        primary_contrast_np = all_contrasts_np[:, primary_contrast_idx]
+        
+        gt_masks_raw = batch[f'masks_{id_}'][:, primary_contrast_idx]
+        gt_masks_np = gt_masks_raw.cpu().numpy()
+        pred_masks_np = (torch.sigmoid(outputs['mask']).cpu().detach().numpy() > 0.5)
+
+        # --- Instantiate helpers for keypoint calculation ---
+        # com_calculator = CenterOfMassLoss()._calculate_com
+        quantile_calculator = MassQuantileLoss(quantiles=[0.25, 0.5, 0.75])._calculate_quantiles
+
+        log_images = []
+        for i in range(min(all_contrasts_np.shape[0], 4)): # Iterate through batch items
+            panels, panel_captions = [], []
+            
+            # --- Panel 1: Original Misaligned Overlap ---
+            h, w = all_contrasts_np.shape[3], all_contrasts_np.shape[4]
+            misaligned_overlap_img = np.zeros((h, w, 3), dtype=np.uint8)
+            for c_idx in range(all_contrasts_np.shape[1]):
+                img = all_contrasts_np[i, c_idx, 0]
+                binary_mask = (img > 0.1)
                 color = CONTRAST_COLORS[c_idx % len(CONTRAST_COLORS)]
+                misaligned_overlap_img[binary_mask] = color
+            
+            with torch.no_grad():
+                for c_idx in range(all_contrasts_np.shape[1]):
+                    # Get the single image tensor for calculation
+                    img_tensor = torch.tensor(all_contrasts_np[i, c_idx]).unsqueeze(0)
+                    # prob_map = torch.sigmoid(img_tensor)
+                    color = CONTRAST_COLORS[c_idx % len(CONTRAST_COLORS)]
 
-                # Calculate keypoints
-                com = com_calculator(img_tensor)[0].cpu().numpy()
-                quantiles = [q[0].cpu().numpy() for q in quantile_calculator(img_tensor)]
+                    # Calculate keypoints
+                    # com = com_calculator(img_tensor)[0].cpu().numpy()
+                    quantiles = [q[0].cpu().numpy() for q in quantile_calculator(img_tensor)]
 
-                if c_idx>0 : 
-                    size_factor = 1.5
-                else : size_factor = 1.0
-                color_ = [int(el//2) for el in color]
-                draw_keypoints(misaligned_overlap_img, com, quantiles, color_, size_factor)
+                    if c_idx>0 : 
+                        size_factor = 1.5
+                    else : size_factor = 1.0
+                    color_ = [int(el//2) for el in color]
+                    draw_keypoints(misaligned_overlap_img, None, quantiles, color_, size_factor)
 
 
-        panels.append(misaligned_overlap_img)
-        panel_captions.append("Misaligned Overlap")
-        
-        # --- Panel 2: Aligned Overlap with Keypoints ---
-        aligned_overlap_img = np.zeros((h, w, 3), dtype=np.uint8)
-        for c_idx in range(aligned_contrasts_np.shape[1]):
-            img = aligned_contrasts_np[i, c_idx, 0]
-            binary_mask = (img > 0.1)
-            color = CONTRAST_COLORS[c_idx % len(CONTRAST_COLORS)]
-            aligned_overlap_img[binary_mask] = color
-        
-        # Calculate and draw keypoints on the aligned overlap image
-        with torch.no_grad():
-            for c_idx in range(aligned_contrasts_t.shape[1]):
-                # Get the single image tensor for calculation
-                img_tensor = aligned_contrasts_t[i, c_idx].unsqueeze(0)
-                # prob_map = torch.sigmoid(img_tensor)
+            panels.append(misaligned_overlap_img)
+            panel_captions.append("Misaligned Overlap")
+            
+            # --- Panel 2: Aligned Overlap with Keypoints ---
+            aligned_overlap_img = np.zeros((h, w, 3), dtype=np.uint8)
+            for c_idx in range(aligned_contrasts_np.shape[1]):
+                img = aligned_contrasts_np[i, c_idx, 0]
+                binary_mask = (img > 0.1)
                 color = CONTRAST_COLORS[c_idx % len(CONTRAST_COLORS)]
+                aligned_overlap_img[binary_mask] = color
+            
+            # Calculate and draw keypoints on the aligned overlap image
+            with torch.no_grad():
+                for c_idx in range(aligned_contrasts_t.shape[1]):
+                    # Get the single image tensor for calculation
+                    img_tensor = aligned_contrasts_t[i, c_idx].unsqueeze(0)
+                    # prob_map = torch.sigmoid(img_tensor)
+                    color = CONTRAST_COLORS[c_idx % len(CONTRAST_COLORS)]
 
-                # Calculate keypoints
-                com = com_calculator(img_tensor)[0].cpu().numpy()
-                quantiles = [q[0].cpu().numpy() for q in quantile_calculator(img_tensor)]
+                    # Calculate keypoints
+                    # com = com_calculator(img_tensor)[0].cpu().numpy()
+                    quantiles = [q[0].cpu().numpy() for q in quantile_calculator(img_tensor)]
 
-                if c_idx>0 : 
-                    size_factor = 1.5
-                else : size_factor = 1.0
-                color_ = [int(el//2) for el in color]
-                draw_keypoints(aligned_overlap_img, com, quantiles, color_, size_factor)
+                    if c_idx>0 : 
+                        size_factor = 1.5
+                    else : size_factor = 1.0
+                    color_ = [int(el//2) for el in color]
+                    draw_keypoints(aligned_overlap_img, None, quantiles, color_, size_factor)
 
-        panels.append(aligned_overlap_img)
-        panel_captions.append("Aligned Overlap + Keypoints")
-    
-        for c_idx in range(aligned_contrasts_np.shape[1]):
-            img = (aligned_contrasts_np[i, c_idx, 0] * 255).astype(np.uint8)
-            panels.append(cv2.cvtColor(img, cv2.COLOR_GRAY2RGB))
-            panel_captions.append(f"Aligned Contrast C{config['contrasts_to_use'][c_idx]}")
-
+            panels.append(aligned_overlap_img)
+            panel_captions.append("Aligned Overlap + Keypoints")
         
-        gt_mask_img = (gt_masks_np[i, 0] * 255).astype(np.uint8)
-        panels.append(cv2.cvtColor(gt_mask_img, cv2.COLOR_GRAY2RGB))
-        panel_captions.append("GT Mask")
+            for c_idx in range(aligned_contrasts_np.shape[1]):
+                img = (aligned_contrasts_np[i, c_idx, 0] * 255).astype(np.uint8)
+                panels.append(cv2.cvtColor(img, cv2.COLOR_GRAY2RGB))
+                panel_captions.append(f"Aligned Contrast C{config['contrasts_to_use'][c_idx]}")
 
-        pred_mask_img = (pred_masks_np[i, 0] * 255).astype(np.uint8)
-        panels.append(cv2.cvtColor(pred_mask_img, cv2.COLOR_GRAY2RGB))
-        panel_captions.append("Pred Mask")
-        
-        if processed_image is not None: 
-            processed_image_ = (processed_image[i, 0] * 255).astype(np.uint8)
-            panels.append(cv2.cvtColor(processed_image_, cv2.COLOR_GRAY2RGB))
-            panel_captions.append(f"Contrast merged - max_dice {max_dice:.2f}")
-            # log_images.append(wandb.Image(processed_image, caption=f"Processed Image for Subj {batch['subject_id'][i]}, max_dice:{max_dice}"))
-    
+            
+            gt_mask_img = (gt_masks_np[i, 0] * 255).astype(np.uint8)
+            panels.append(cv2.cvtColor(gt_mask_img, cv2.COLOR_GRAY2RGB))
+            panel_captions.append("GT Mask")
 
-        final_image = np.concatenate(panels, axis=1)
-        final_caption = f"Subj {batch['subject_id'][i]}: " + " | ".join(panel_captions)
-        log_images.append(wandb.Image(final_image, caption=final_caption))
+            pred_mask_img = (pred_masks_np[i, 0] * 255).astype(np.uint8)
+            panels.append(cv2.cvtColor(pred_mask_img, cv2.COLOR_GRAY2RGB))
+            panel_captions.append("Pred Mask")
+            
+            if processed_image is not None: 
+                processed_image_ = (processed_image[i, 0] * 255).astype(np.uint8)
+                panels.append(cv2.cvtColor(processed_image_, cv2.COLOR_GRAY2RGB))
+                panel_captions.append(f"Contrast merged - max_dice {max_dice:.2f}")
+                # log_images.append(wandb.Image(processed_image, caption=f"Processed Image for Subj {batch['subject_id'][i]}, max_dice:{max_dice}"))
         
+
+            final_image = np.concatenate(panels, axis=1)
+            final_caption = f"Subj {batch['subject_id'][i]}: " + " | ".join(panel_captions)
+            log_images.append(wandb.Image(final_image, caption=final_caption))
+            
 
     wandb.log({"Validation Predictions": log_images, "epoch": epoch})
 
@@ -333,7 +342,7 @@ def main():
         print(f"Current CUDA device: {torch.cuda.current_device()}")
         print(f"CUDA device name: {torch.cuda.get_device_name(torch.cuda.current_device())}")
     
-    wandb.init(project="multimodal_agnostic_unet_prototype_2", config=config)
+    wandb.init(project="multimodal_agnostic_unet_prototype_3", config=config)
     print(f"✅ Using device: {DEVICE}")
 
     subject_ids = list(range(config["num_subjects"]))
@@ -355,15 +364,15 @@ def main():
         train_dataset, 
         batch_size=config["batch_size"], 
         shuffle=True,
-        num_workers=8,      # Start with 4 or 8 and see what works best
-        pin_memory=True
+        # num_workers=8,      # Start with 4 or 8 and see what works best
+        # pin_memory=True
     )
     val_loader = DataLoader(
         val_dataset, 
         batch_size=config["batch_size"], 
         shuffle=False,
-        num_workers=8,
-        pin_memory=True
+        # num_workers=8,
+        # pin_memory=True
     )
     model = AlignmentAndFusionUNet(
         in_channels=1, 
@@ -374,7 +383,8 @@ def main():
     loss_fn = BoundaryLoss(alpha=config["boundary_loss_alpha"])
     alignment_loss_fn = DiceLoss()
     dff_loss_fn = BendingEnergyLoss()
-    com_loss_fn = CenterOfMassLoss()
+    cosine_sim = nn.CosineSimilarity(dim=1, eps=1e-6)
+    # com_loss_fn = CenterOfMassLoss()
     quantile_loss_fn = MassQuantileLoss(quantiles=[0.25, 0.5, 0.75]) # Using quartiles + median
 
 
@@ -383,6 +393,7 @@ def main():
     lambda_reg = 10.0
     lambda_com = 0.007
     lambda_quantile = 0.002
+    lambda_features = 8.0
     optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
     scheduler = CosineAnnealingLR(optimizer, T_max=config["num_epochs"])
     
@@ -397,20 +408,19 @@ def main():
         total_reg_loss = 0
         total_epoch_com_loss = 0
         total_epoch_quantile_loss = 0
+        total_features_loss = 0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
-            all_contrasts = batch['contrasts'].to(DEVICE)
-            all_masks = batch['masks'].to(DEVICE)
+            optimizer.zero_grad()
             
+            features = []
+            ids = ["1", "2"]
+            loss = 0.0
+            
+            for id_ in ids : 
+                all_contrasts = batch[f'contrasts_{id_}'].to(DEVICE)
+                all_masks = batch[f'masks_{id_}'].to(DEVICE)
+                
 
-            # Use integer indexing to remove the singleton dimension, creating a 4D tensor
-            if epoch < config["single_contrast_epochs"]:
-                random_contrast_idx = config['contrasts_to_use'].index(random.choice(config['contrasts_to_use']))
-                
-                reference_contrast = all_contrasts[:, random_contrast_idx]
-                reference_mask = all_masks[:, random_contrast_idx].contiguous()
-                moving_contrasts = []
-                
-            else:
                 contrasts_to_use = config['contrasts_to_use']
                 ref_contrast = random.choice(contrasts_to_use) ## we choose a random ref contrast during training !
                 ref_idx = contrasts_to_use.index(ref_contrast)
@@ -422,99 +432,51 @@ def main():
                     all_contrasts[:, i] for i in range(len(contrasts_to_use)) if i != ref_idx 
                 ]
 
-            
-            boundaries = masks_to_boundaries_gpu(reference_mask)
-            
-            optimizer.zero_grad()
-            outputs = model(reference_contrast, moving_contrasts)
-            warped_contrasts = outputs["warped_moving_contrasts"] 
-
-            num_warped = warped_contrasts.size()[1] - 1 # Exclude the reference image
-            
-            tmp_total_com_loss = 0.0
-            tmp_total_quantile_loss = 0.0
-            if num_warped > 0:
-                for i in range(num_warped):
-                    # The first image in the stack is the reference
-                    warped_img = warped_contrasts[:, i+1, ...]
-                    
-                    # It's best to compare the predicted masks if available, or the images themselves
-                    # For example, using sigmoid to get probability maps
-                    # ref_prob = torch.sigmoid(reference_contrast)
-                    # warped_prob = torch.sigmoid(warped_img)
-
-                    tmp_total_com_loss += com_loss_fn(reference_contrast, warped_img)
-                    tmp_total_quantile_loss += quantile_loss_fn(reference_contrast, warped_img)
-
-                com_loss = tmp_total_com_loss / num_warped
-                quantile_loss = tmp_total_quantile_loss / num_warped
-            else:
-                com_loss = 0.0
-                quantile_loss = 0.0
                 
-            seg_loss, mask_loss, boundary_loss = loss_fn(outputs, {"mask": reference_mask, "boundary": boundaries})
-            
-            total_align_loss = 0
-            if moving_contrasts and 'warped_moving_contrasts' in outputs:
-                warped_tensors = outputs['warped_moving_contrasts'] # B, C, 1, SIZE, SIZE
-                adapted_warped_tensors = warped_tensors.transpose(0, 1)
-                for i, warped_mov_contrast in enumerate(adapted_warped_tensors):
-                    if i==0 : continue #skip the ref contrast
-                    total_align_loss += alignment_loss_fn(warped_mov_contrast.contiguous(), reference_contrast.contiguous())
-            
-            # dff_loss = dff_loss_fn(outputs["predicted_ddfs"])
-            # Combined Loss
-            deviations = outputs["predicted_deviations"]
-            reg_loss = torch.mean(deviations**2) 
-            
-            loss = (seg_loss 
-                + lambda_alignment * total_align_loss 
-                + lambda_reg * reg_loss
-                + lambda_com * com_loss
-                + lambda_quantile * quantile_loss)
-            
+                boundaries = masks_to_boundaries_gpu(reference_mask)
+                
+                outputs = model(reference_contrast, moving_contrasts)
+                features.append(outputs["bottlenecks"]) # B, N, C, H, W
+  
+                seg_loss, mask_loss, boundary_loss = loss_fn(outputs, {"mask": reference_mask, "boundary": boundaries})
+                
+                loss += seg_loss 
+
+                if id_ == ids[-1] :
+                    features_loss = 1 - cosine_sim(features[0].flatten(2), features[1].flatten(2)).mean()
+                    loss += features_loss 
+                    total_features_loss += features_loss.item() * lambda_features
+                
+                total_loss += loss.item()
+                total_mask_loss += mask_loss.item()
+                total_boundary_loss += boundary_loss.item()  
             
             
             loss.backward()
+                          
             optimizer.step()
-            
-            
-            total_loss += loss.item()
-            total_mask_loss += mask_loss.item()
-            total_boundary_loss += boundary_loss.item()
-            total_epoch_align_loss += lambda_alignment * total_align_loss.item()
-            total_reg_loss += reg_loss.item() * lambda_reg
-            total_epoch_com_loss += com_loss.item() * lambda_com
-            total_epoch_quantile_loss += quantile_loss.item() * lambda_quantile
-            # total_dff_loss += dff_loss.item() * lambda_dff
 
         wandb.log({"train_losses/total_loss": total_loss, 
                    "train_losses/mask_loss": total_mask_loss, 
                    "train_losses/boundary_loss": total_boundary_loss, 
-                   "train_losses/align_loss": total_epoch_align_loss, 
-                   "train_losses/dff_loss": total_dff_loss, 
-                   "train_losses/reg_loss": total_reg_loss,
-                   "train_losses/com_loss": total_epoch_com_loss,
+                #    "train_losses/align_loss": total_epoch_align_loss, 
+                #    "train_losses/dff_loss": total_dff_loss, 
+                #    "train_losses/reg_loss": total_reg_loss,
+                   "train_losses/features_loss": total_features_loss,
+                #    "train_losses/com_loss": total_epoch_com_loss,
                     # "metrics/max_abosulte_dice": max_absolute_dice,
-                   "train_losses/quantile_loss": total_epoch_quantile_loss})
+                #    "train_losses/quantile_loss": total_epoch_quantile_loss})
+        })
             
         
         model.eval()
         total_val_dice = 0
         with torch.no_grad():
             for i, batch in enumerate(tqdm(val_loader, desc=f"Epoch {epoch+1} [Val]")):
-                if epoch < config["single_contrast_epochs"]:
-                    random_contrast_idx = config['contrasts_to_use'].index(random.choice(config['contrasts_to_use']))
-                
-                    reference_contrast = all_contrasts[:, random_contrast_idx]
-                    reference_mask = all_masks[:, random_contrast_idx].contiguous()
-                    moving_contrasts = []
-                else : 
-                    # for k in range(len(config["contrasts_to_use"])):
-                        # if random.random() <= config["contrast_dropout_rate"]:
-                            
-                    all_contrasts = batch['contrasts'].to(DEVICE)
-                    all_masks = batch['masks'].to(DEVICE)
+                ids = ["1", "2"]
+                for id_ in ids :
+                    all_contrasts = batch[f'contrasts_{id_}'].to(DEVICE)
+                    all_masks = batch[f'masks_{id_}'].to(DEVICE)
 
                     contrasts_to_use = config['contrasts_to_use']
                     ref_idx = contrasts_to_use.index(config['primary_contrast_id'])
@@ -526,8 +488,8 @@ def main():
                         all_contrasts[:, i] for i in range(len(contrasts_to_use)) if i!= ref_idx
                     ]
 
-                outputs = model(reference_contrast, moving_contrasts)
-                total_val_dice += dice_metric(outputs['mask'], reference_mask)
+                    outputs = model(reference_contrast, moving_contrasts)
+                    total_val_dice += dice_metric(outputs['mask'], reference_mask)/len(ids)
                 
                 if i == 0:
                     with torch.no_grad():
